@@ -1,0 +1,775 @@
+<?php
+require_once "../../lib/include.php";
+
+$mode = $_POST["mode"];
+
+if($mode == "INIT") {
+
+    $jno = $_POST['jno'];
+
+    //JOB 정보
+    $SQL = "SELECT J. JNO, J.JOB_NO, J.COMP_NAME, J.ORDER_COMP_NAME, J.JOB_NAME, U.USER_NAME, 
+                    TO_CHAR(TO_DATE(J.JOB_SD, 'YY/MM/DD'),'YYYY-MM-DD') AS JOB_SD, TO_CHAR(TO_DATE(J.JOB_ED, 'YY/MM/DD'),'YYYY-MM-DD') AS JOB_ED,
+                    S.CD_NM AS JOB_STATE
+            FROM JOB_INFO J , S_SYS_USER_SET U,
+                    (SELECT MINOR_CD, CD_NM FROM SYS_CODE_SET WHERE MAJOR_CD = 'JOB_STATE' AND IS_USE = 'Y') S
+            WHERE U.UNO = J.JOB_PM 
+            AND J.JOB_STATE = S.MINOR_CD
+            AND J.JNO = :JNO
+            ORDER BY JOB_NO DESC";
+    $params = array(
+        ":JNO" => $jno
+    );
+
+    $timesheetDB->query($SQL, $params);
+    while($timesheetDB->next_record()) {
+        $row = $timesheetDB->Record;
+
+        $jobDetail = array(
+            "jno" => $row["jno"],
+            "jobNo" => $row["job_no"],
+            "compName" => $row["comp_name"],
+            "orderCompName" => $row["order_comp_name"],
+            "jobName" => $row["job_name"],
+            "userName" => $row["user_name"],
+            "jobSd" => $row["job_sd"],
+            "jobEd" => $row["job_ed"],
+            "jobState" => $row["job_state"]
+        );
+    }
+
+    //현장소장 가져오기
+    $SQL = "SELECT U.UNO, U.USER_NAME, U.DUTY_NAME
+            FROM JOB_MEMBER_LIST M, S_SYS_USER_SET U
+            WHERE M.COMP_TYPE = 'H'
+            AND U.UNO = M.UNO
+            AND M.FUNC_CODE = 510
+            AND M.CHARGE = '21'
+            AND M.JNO = :JNO
+            AND M.IS_USE = 'Y'";
+
+    $timesheetDB->query($SQL, $params);
+    $timesheetDB->next_record();
+    $row = $timesheetDB->Record;
+
+    $superIntendent = array(
+        "uno" => $row["uno"],
+        "userName" => $row["user_name"],
+        "dutyName" => $row["duty_name"]
+    );
+
+    if(!empty($superIntendent)) {
+        $SQL = "MERGE INTO JOB_MANAGER M
+                USING dual
+                    ON (M.JNO = :JNO AND AUTH = 'SUPERINTENDENT') 
+                WHEN MATCHED THEN
+                    UPDATE SET UNO = :UNO, MOD_USER = :MOD_USER, MOD_DATE = SYSTIMESTAMP
+                WHEN NOT MATCHED THEN ";
+        $SQL .= "INSERT(JNO, AUTH, UNO, REG_USER, REG_DATE, MOD_USER, MOD_DATE) ";
+        $SQL .= "VALUES(:JNO, :AUTH, :UNO, :REG_USER, SYSTIMESTAMP, :MOD_USER, SYSTIMESTAMP) ";
+        $params = array(
+            ":JNO" => $jno,
+            ":AUTH" => "SUPERINTENDENT",
+            ":UNO" => $superIntendent["uno"],
+            ":REG_USER" => $user->uno,
+            ":MOD_USER" => $user->uno
+        );
+        $db->query($SQL, $params);
+    }
+
+    //공종(현장) 종류 가져오기
+    $SQL = "SELECT FUNC_NO, FUNC_NAME
+            FROM COMMON.COMM_FUNC_QHSE
+            WHERE IS_USE = 'Y'
+            ORDER BY SORT_NO";
+
+    $db->query($SQL);
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $disciplineList[] = array(
+            "funcNo" => $row["func_no"],
+            "funcName" => $row["func_name"]
+        );
+    }
+
+    $editAuth = "N";    //  A : 전체,   P : 일부,   N : 편집불가
+    if ($_SESSION["user"]["QH"] == "Y") {
+        $editAuth = "A";
+    }
+    else 
+    if ($_SESSION["risk"]["user_type"] == "HEAD") {
+        if (in_array($_SESSION["risk"]["auth"], array("SUPERINTENDENT", "SAFETY_MANAGER"))) {
+            $editAuth = "A";
+        } else if($_SESSION["risk"]["auth"] == "SUPERVISOR") {
+            $editAuth = "P";
+        }
+    }
+
+    $result = array(
+        "jobDetail" => $jobDetail,
+        "safeManagerList" => importSafeManager($jno),
+        "superIntendent" => $superIntendent,
+        "disciplineList" => $disciplineList,
+        "editAuth" => $editAuth
+    );
+
+    echo json_encode($result);
+}
+//안전관리자 반영
+else if($mode == "SM_EDIT") {
+    $jno = $_POST["jno"];
+    $selSafeManagerList = $_POST["selSafeManagerList"];
+    $teamLeader = $_POST["teamLeaderUno"];
+    $proceed = true;
+    $overCnt = 0;
+
+    //중복체크
+    if($selSafeManagerList) {
+        foreach($selSafeManagerList as $uno) {
+            $SQL = "SELECT * FROM JOB_MANAGER
+                    WHERE JNO = :JNO
+                    AND AUTH <> 'SAFETY_MANAGER'
+                    AND UNO = :UNO";
+            $params = array(
+                ":JNO" => $jno,
+                ":UNO" => $uno
+            );
+            $db->query($SQL, $params);
+
+            $count = $db->nf();
+
+            if($count > 0) {
+                $overCnt++;
+            }
+        }
+
+        if($overCnt > 0) {
+            $proceed = false;
+            $msg = "현장소장 또는 관리감독자와 중복 됩니다. 다시 선택해주세요.";
+        }
+    }
+
+    if($proceed) {
+        $SQL = "DELETE FROM JOB_MANAGER 
+                WHERE JNO = :JNO
+                AND AUTH = 'SAFETY_MANAGER'";
+        $params = array(
+            ":jno" => $jno
+        );
+        $db->query($SQL, $params);
+    
+        if($selSafeManagerList) {
+            $safeCnt = 0;
+            foreach($selSafeManagerList as $uno) {
+                if($teamLeader == $uno) {
+                    $isTeamLeader = 'Y';
+                    $safeCnt++;
+                } else if ($safeCnt == 0) {
+                    $isTeamLeader = 'Y';
+                    $safeCnt++;
+                } else {
+                    $isTeamLeader = 'N';
+                }
+                $SQL = "INSERT INTO JOB_MANAGER(JNO, AUTH, UNO, REG_USER, REG_DATE, TEAM_LEADER)
+                        VALUES (:jno, :auth, :uno, :reg_user, SYSTIMESTAMP, :isTeamLeader)";
+
+                $params = array(
+                    ":jno" => $_POST["jno"],
+                    ":auth" => "SAFETY_MANAGER",
+                    ":uno" => $uno,
+                    ":reg_user" => $user->uno,
+                    ":isTeamLeader" => $isTeamLeader
+                );
+        
+                if($db->query($SQL, $params)) {
+                    $proceed = true;
+                }
+            }
+        }
+    }
+
+    $result = array(
+        "proceed" => $proceed,
+        "msg" => $msg
+    );
+
+    echo json_encode($result);
+
+}
+else if($mode == "SM_IMPORT") {
+    $jno = $_POST["jno"];
+
+    $result = array(
+        "safeManagerList" => importSafeManager($jno)
+    );
+
+    echo json_encode($result);
+}
+//협력업체 가져오기
+else if($mode == "SUBCON_IMPORT") {
+    $jno = $_POST["jno"];
+
+    $url = "http://wcfservice.hi-techeng.co.kr/apipcs/getcontractinfo?jno={$jno}&contracttype=C";
+
+    $curl = curl_init();
+
+    curl_setopt_array($curl, array(
+    //         CURLOPT_PORT => "80",
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => "",
+        CURLOPT_MAXREDIRS => 10,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        CURLOPT_CUSTOMREQUEST => "GET",
+        CURLOPT_HTTPHEADER => array(
+            "cache-control: no-cache",
+            "content-type: text/plain; charset=utf-8"
+        ),
+    ));
+
+    $response = curl_exec($curl);
+    //     $err = curl_error($curl);
+    curl_close($curl);
+
+    $responseResult = json_decode($response);
+
+    for($i=0; $i < count($responseResult->Value); $i++) {
+        $cno = $responseResult->Value[$i]->COMP_CNO;
+        $subconList[$cno] = array(
+            "cno" => $cno,
+            "projectName" => $responseResult->Value[$i]->PROJECT_NAME,
+            "compName" => $responseResult->Value[$i]->COMP_NAME_KR,
+            "compRegNo" => $responseResult->Value[$i]->COMP_REG_NO,
+            "compCeoName" => $responseResult->Value[$i]->COMP_CEO_NAME
+        );
+    }
+
+    $SQL = "SELECT S.JNO, S.CNO, S.ID, S.PW, S.CELLPHONE, S.EMAIL, U.USER_NAME, U.DUTY_NAME
+            FROM JOB_SUBCON_INFO S, S_SYS_USER_SET U
+            WHERE S.UNO = U.UNO(+)
+            AND S.IS_USE = 'Y'
+            AND S.JNO = :JNO";
+    $params = array(
+        ":JNO" => $jno
+    );
+    $db->query($SQL, $params);
+
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $subconInfoList[$row["cno"]] = array(
+            "jno" => $row["jno"],
+            "cno" => $row["cno"],
+            "id" => $row["id"],
+            "pw" => $row["pw"],
+            "cellphone" => $row["cellphone"],
+            "email" => $row["email"],
+            "userName" => $row["user_name"],
+            "dutyName" => $row["duty_name"]
+        );
+    }
+
+    //공종(현장) 가져오기
+    $SQL = "SELECT F.JNO, F.CNO, C.FUNC_NO, C.FUNC_NAME
+            FROM JOB_SUBCON_FUNC F, COMMON.COMM_FUNC_QHSE C
+            WHERE F.FUNC_NO = C.FUNC_NO
+            AND C.IS_USE = 'Y'
+            AND F.JNO = :JNO";
+    
+    $db->query($SQL, $params);
+
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $disciplineList[] = array(
+            "jno" => $row["jno"],
+            "cno" => $row["cno"],
+            "funcNo" => $row["func_no"],
+            "funcName" => $row["func_name"]
+        );
+    }
+
+    //공종(현장) 종류 가져오기
+    $SQL = "SELECT FUNC_NO, FUNC_NAME
+            FROM COMMON.COMM_FUNC_QHSE
+            WHERE IS_USE = 'Y'
+            ORDER BY SORT_NO";
+
+    $db->query($SQL);
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $disciplineListAll[] = array(
+            "funcNo" => $row["func_no"],
+            "funcName" => $row["func_name"]
+        );
+    }
+
+    $result = array(
+        "subconList" => $subconList,
+        "subconInfoList" => $subconInfoList,
+        "disciplineList" => $disciplineList,
+        "disciplineListAll" => $disciplineListAll
+    );
+
+    echo json_encode($result);
+}
+//첨부파일 저장
+else if($mode == "SAVE_ATTACH") {
+    $jno = $_POST["jno"];
+    $proceed = true;
+    $deleteAttachIdList = $_POST["deleteAttachIdList"];
+
+    //첨부파일 삭제
+    if($deleteAttachIdList) {
+        foreach($deleteAttachIdList as $id) {
+            //물리 삭제
+            $SQL = "SELECT FILE_LOCATION 
+                    FROM JOB_ATCH
+                    WHERE JNO_FNO = :JNO_FNO";
+            $params = array(
+                ":JNO_FNO" => $id
+            );
+            $db->query($SQL, $params);
+
+            $db->next_record();
+            $row = $db->Record;
+            unlink($row["file_location"]);
+
+            //데이터베이스 삭제
+            $SQL = "DELETE FROM JOB_ATCH WHERE JNO_FNO = :JNO_FNO";
+            $db->query($SQL, $params);
+        }
+    }
+
+    //존재하는 파일
+    $existAttach = $_POST["existAttach"];
+    $existFileList = array();
+    if (count($existAttach) > 0) {
+        foreach($existAttach as $f) {
+            $existFileList[]= strtolower($f);
+        }
+    }
+    $fileList = array();
+    for ($i=0; $i<count($_FILES['newAttachFile']['name']); $i++) {
+        if (!empty($_FILES['newAttachFile']['name'][$i])) {
+            $newFileName = "";
+            $info = pathinfo($_FILES['newAttachFile']['name'][$i]);
+            $oriFileName = $info['basename'];
+            $ext = "." . $info['extension'];
+            $fileName = $info['filename'];
+            //지원하지 않는 특수문자 제거
+            $fileName = iconv("UTF-8", "EUC-KR//TRANSLIT", $fileName);
+            $fileName = iconv("EUC-KR", "UTF-8", $fileName);
+            if(count($existFileList) > 0) {
+                $tempFileName = $fileName . $ext;
+                //파일 이름이 중복된다면 (n) 번을 붙여서 저장
+                if (in_array(strtolower($tempFileName), $existFileList)) {
+                    $overCnt = array_count_values($existFileList);
+                    $j = 1;
+                    if($overCnt[$tempFileName] >= 2) {
+                        $j = $overCnt[$tempFileName];
+                    } 
+                    do {
+                        $tempFileName = $fileName . "(" . $j++ . ")" . $ext;
+                    } while(in_array(strtolower($tempFileName), $existFileList));
+                }
+                $existFileList[] = strtolower($tempFileName);
+                $newFileName = $tempFileName;
+            } else {
+                $newFileName = $fileName . $ext;
+            }
+            if(!file_exists("../upload/project/{$jno}")) {
+                mkdir("../upload/project/{$jno}", 0777, true);
+            }
+            $uploadDir = dirname(__DIR__) . "/upload/project/{$jno}/" . $newFileName;
+            $uploadFile = $_FILES['newAttachFile']['tmp_name'][$i];
+            
+            if (move_uploaded_file($uploadFile, $uploadDir)) {
+                $SQL = "INSERT INTO JOB_ATCH(JNO_FNO, JNO, FILE_NAME, FILE_LOCATION)
+                        VALUES(SEQ_JNO_FNO.NEXTVAL, :JNO, :FILE_NAME, :FILE_LOCATION)";
+                $params = array(
+                    ":JNO" => $jno,
+                    ":FILE_NAME" => $oriFileName,
+                    ":FILE_LOCATION" => $uploadDir
+                );
+                $db->query($SQL, $params);
+            } else {
+                $proceed = false;
+            }
+        }
+    }
+
+    $result = array(
+        "proceed" => $proceed
+    );
+
+    echo json_encode($result);
+}
+//첨부파일 불러오기
+else if($mode == "IMPORT_ATTACH") {
+    $jno = $_POST["jno"];
+
+    $SQL = "SELECT JNO_FNO, JNO, FILE_NAME, FILE_LOCATION
+            FROM JOB_ATCH
+            WHERE JNO = :JNO";
+    $params = array(
+        ":JNO" => $jno
+    );
+
+    $db->query($SQL, $params);
+
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $attachList[] = array(
+            "jnoFno" => $row["jno_fno"],
+            "jno" => $row["jno"],
+            "fileName" => $row["file_name"],
+            "fileLocation" => $row["file_location"]
+        );
+    }
+
+    $result = array(
+        "attachList" => $attachList
+    );
+
+    echo json_encode($result);
+}
+//관리감독자 추가
+else if($mode == "SV_ADD") {
+    $jno = $_POST["jno"]; 
+    // $selSupervisorList = $_POST["selSupervisorList"];
+    $selUnoSV = $_POST["selUnoSV"];
+    $chkDisciplineList = $_POST["chkDisciplineList"];
+    $proceed = true;
+    $overCnt = 0;
+
+    //중복체크
+    $SQL = "SELECT * FROM JOB_MANAGER
+            WHERE JNO = :JNO
+            AND AUTH <> 'SUPERVISOR'
+            AND UNO = :UNO";
+    $params = array(
+        ":JNO" => $jno,
+        ":UNO" => $selUnoSV
+    );
+    $db->query($SQL, $params);
+    $count = $db->nf();
+
+    if($count > 0) {
+        $proceed = false;
+        $msg = "현장소장 또는 안전관리자와 중복됩니다. 다시 선택하세요.";
+    }
+
+    if($proceed) {
+        foreach($chkDisciplineList as $discipline) {
+            $proceed = false;
+            $SQL = "MERGE INTO JOB_MANAGER
+                    USING DUAL
+                    ON (JNO = :JNO AND AUTH = 'SUPERVISOR' AND UNO = :UNO)
+                    WHEN NOT MATCHED THEN
+                    INSERT (JNO, AUTH, UNO, REG_USER, REG_DATE, MOD_USER, MOD_DATE) 
+                    VALUES(:JNO, 'SUPERVISOR', :UNO, :REG_USER, SYSTIMESTAMP, :MOD_USER, SYSTIMESTAMP) ";
+            $params = array(
+                ":JNO" => $jno,
+                ":UNO" => $selUnoSV,
+                ":REG_USER" => $user->uno,
+                ":MOD_USER" => $user->uno
+            );
+            if($db->query($SQL, $params)) {
+                $proceed = true;
+            }
+
+            if ($proceed) {
+                $SQL = "MERGE INTO JOB_MANAGER_FUNC
+                        USING DUAL
+                        ON (JNO = :JNO AND UNO = :UNO AND FUNC_NO = :FUNC_NO)
+                        WHEN NOT MATCHED THEN
+                        INSERT (JNO, UNO, FUNC_NO) 
+                        VALUES(:JNO, :UNO, :FUNC_NO) ";
+                $params = array(
+                    ":JNO" => $jno,
+                    ":UNO" => $selUnoSV,
+                    ":FUNC_NO" => $discipline
+                );
+                if($db->query($SQL, $params)) {
+                    $proceed = true;
+                }
+            }
+        }
+    }
+
+    // if ($proceed) {
+    //     $delSupervisor = array_diff($preSupervisor, $selSupervisorList);
+    //     if (count($delSupervisor) > 0) {
+    //         foreach($delSupervisor as $val) {
+    //             $SQL = "DELETE FROM JOB_MANAGER
+    //             WHERE JNO = :JNO
+    //              AND UNO = :UNO
+    //              AND NOT EXISTS (
+    //             SELECT UNO
+    //             FROM JOB_MANAGER_FUNC
+    //             WHERE JNO = :JNO
+    //              AND UNO = :UNO
+    //              AND FUNC_NO = :FUNC_NO
+    //             ) ";
+    //             $params = array(
+    //                 ":JNO" => $jno,
+    //                 ":UNO" => $val,
+    //                 ":FUNC_NO" => $selDiscipline
+    //             );
+    //             if($db->query($SQL, $params)) {
+    //                 $proceed = true;
+    //             }
+    //         }
+    //     }
+    // }
+
+    $result = array(
+        "proceed" => $proceed,
+        "msg" => $msg
+    );
+
+    echo json_encode($result);
+}
+//관리감독자 가져오기
+else if($mode == "IMPORT_SV") {
+    $jno = $_POST["jno"];
+    $funcNo = $_POST["selDiscipline"];
+    
+    $SQL = "SELECT FUNC_NO, FUNC_NAME
+            FROM COMMON.COMM_FUNC_QHSE
+            WHERE IS_USE = 'Y'
+            ORDER BY SORT_NO";
+    $db->query($SQL);
+
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $disciplineList[] = array(
+            "funcNo" => $row["func_no"],
+            "funcName" => $row["func_name"]
+        );
+    }
+
+    //관리감독자 목록
+    $supervisorList = importSupervisor($jno, $funcNo);
+
+    $result = array(
+        "supervisorList" => $supervisorList,
+        "disciplineList" => $disciplineList
+    );
+
+    echo json_encode($result);
+}
+//관리감독자 삭제
+else if($mode == "DEL_SV") {
+    $jno = $_POST["jno"];
+    $delUnoSV = $_POST["delUnoSV"];
+    $delFuncNoSV = $_POST["delSVFuncNoList"];
+
+    foreach($delFuncNoSV as $val) {
+        $SQL = "DELETE FROM JOB_MANAGER_FUNC
+                WHERE JNO = :JNO
+                AND UNO = :UNO
+                AND FUNC_NO = :FUNC_NO";
+        $params = array(
+            ":JNO" => $jno,
+            ":UNO" => $delUnoSV,
+            ":FUNC_NO" => $val
+        );
+        $db->query($SQL, $params);
+    }
+
+    // $SQL = "SELECT * FROM JOB_MANAGER_FUNC
+    //         WHERE JNO = :JNO
+    //         AND UNO = :UNO";
+    // $db->query($SQL, $params);
+    // $count = $db->nf();
+
+    $SQL = "DELETE FROM JOB_MANAGER
+            WHERE JNO = :JNO
+            AND AUTH = 'SUPERVISOR'
+            AND UNO = :UNO";
+    $db->query($SQL, $params);
+
+    $result = array();
+
+    echo json_encode($result);
+}
+//안전관리자 팀장 선택
+else if($mode == "SEL_LEADER") {
+    $jno = $_POST["jno"];
+    $selTeamLeaerUno = $_POST["selTeamLeaderUno"];
+
+    $SQL = "UPDATE JOB_MANAGER
+            SET TEAM_LEADER = 'N'
+            WHERE JNO = :JNO
+            AND AUTH = 'SAFETY_MANAGER'";
+    $params = array(
+        ":JNO" => $jno
+    );
+    if($db->query($SQL, $params)) {
+        $SQL = "UPDATE JOB_MANAGER
+                SET TEAM_LEADER = 'Y', MOD_USER = :MOD_USER, MOD_DATE = SYSTIMESTAMP
+                WHERE JNO = :JNO
+                AND AUTH = 'SAFETY_MANAGER'
+                AND UNO= :UNO";
+        $params = array(
+            ":JNO" => $jno,
+            ":MOD_USER" => $user->uno,
+            ":UNO" => $selTeamLeaerUno
+        );
+        $db->query($SQL, $params);
+    }
+
+    $result = array();
+
+    echo json_encode($result);
+}
+//공종(현장) 저장
+else if($mode == "SV_SAVE") {
+    $changeFuncSVList = $_POST["changeFuncSVList"];
+    $jno = $_POST["jno"];
+
+    $selSupervisorList = array();
+    $chkDisciplineList = array();
+
+    if($changeFuncSVList) {
+        foreach($changeFuncSVList as $val) {
+            list($selSupervisorList[], $chkDisciplineList[]) = explode("|", $val);
+        }
+
+        if($selSupervisorList) {
+            $SQL = "DELETE FROM JOB_MANAGER_FUNC
+                    WHERE JNO = :JNO";
+            $params = array(
+                ":JNO" => $jno
+            );
+            $db->query($SQL, $params);
+            
+            //선택된 공종이 아예 없을 경우 관리감독자에서 삭제
+            $SQL = "SELECT UNO 
+                    FROM JOB_MANAGER
+                    WHERE JNO = :JNO
+                    AND AUTH = 'SUPERVISOR'";
+            $db->query($SQL, $params);
+
+            $svList = array();
+            while($db->next_record()) {
+                $row = $db->Record;
+
+                $svList[] = $row["uno"];
+            }
+
+            foreach($svList as $val) {
+                if(!in_array($val, $selSupervisorList)) {
+                    $SQL = "DELETE FROM JOB_MANAGER
+                            WHERE JNO = :JNO
+                            AND AUTH = 'SUPERVISOR'
+                            AND UNO = :UNO";
+                    $params = array(
+                        ":JNO" => $jno,
+                        ":UNO" => $val
+                    );
+                    $db->query($SQL, $params);
+                }
+            }
+
+            foreach($selSupervisorList as $key => $val) {
+                $params = array();
+                $SQL = "MERGE INTO JOB_MANAGER_FUNC
+                        USING DUAL
+                        ON (JNO = :JNO AND UNO = :UNO AND FUNC_NO = :FUNC_NO)
+                        WHEN NOT MATCHED THEN
+                        INSERT (JNO, UNO, FUNC_NO) 
+                        VALUES(:JNO, :UNO, :FUNC_NO) ";
+                $params = array(
+                    ":JNO" => $jno,
+                    ":UNO" => $val,
+                    ":FUNC_NO" => $chkDisciplineList[$key]
+                );
+                if($db->query($SQL, $params)) {
+                    $proceed = true;
+                }
+            }
+        }
+    }
+
+    $result = array();
+
+    echo json_encode($result);
+}
+
+//안전관리자 가져오기
+function importSafeManager($jno) {
+    global $db;
+
+    $SQL = "SELECT U.UNO, U.USER_NAME, U.DUTY_NAME, J.TEAM_LEADER
+            FROM JOB_MANAGER J, S_SYS_USER_SET U
+            WHERE U.UNO = J.UNO
+            AND J.AUTH = 'SAFETY_MANAGER'
+            AND J.JNO = :JNO
+            ORDER BY TEAM_LEADER DESC, U.DUTY_CD, U.JOBDUTY_ID, U.JOIN_DATE, U.USER_NAME";
+    $params = array(
+        ":JNO" => $jno
+    );
+
+    $db->query($SQL, $params);
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $safeManagerList[] = array(
+            "uno" => $row["uno"],
+            "userName" => $row["user_name"],
+            "dutyName" => $row["duty_name"],
+            "teamLeaderYn" => $row["team_leader"]
+        );
+    }
+
+    return $safeManagerList;
+}
+
+//관리감독자 가져오기
+function importSupervisor($jno, $funcNo) {
+    global $db;
+
+    $supervisorList = array();
+    $SQL = "SELECT M.UNO, M.JNO, U.USER_NAME, U.USER_ID, U.DUTY_NAME, U.DUTY_CD, U.JOBDUTY_ID, U.JOIN_DATE, U.USER_NAME, 
+            LISTAGG(F.FUNC_NO, '|') WITHIN GROUP(ORDER BY M.UNO) AS FUNC_NO
+            FROM JOB_MANAGER M
+            RIGHT OUTER JOIN JOB_MANAGER_FUNC F ON F.JNO = M.JNO AND F.UNO = M.UNO
+            JOIN S_SYS_USER_SET U ON M.UNO = U.UNO
+            WHERE M.JNO = :jno
+            AND M.AUTH = 'SUPERVISOR' ";
+    if (!empty($funcNo)) {
+        $SQL .= "AND F.FUNC_NO = :funcNo ";
+    }
+    $SQL .= "GROUP BY M.UNO, M.JNO, U.USER_NAME, U.USER_ID, U.DUTY_NAME, U.DUTY_CD, U.JOBDUTY_ID, U.JOIN_DATE, U.USER_NAME
+            ORDER BY U.DUTY_CD, U.JOBDUTY_ID, U.JOIN_DATE, U.USER_NAME";
+    $params = array(
+        ":jno" => $jno,
+        ":funcNo" => $funcNo
+    );
+    $db->query($SQL, $params);
+
+    while($db->next_record()) {
+        $row = $db->Record;
+
+        $supervisorList[] = array(
+            "jno" => $row["jno"],
+            "userName" => $row["user_name"],
+            "userId" => $row["user_id"],
+            "dutyName" => $row["duty_name"],
+            "uno" => $row["uno"],
+            "funcNo" => $row["func_no"]
+        );
+    }
+
+    return $supervisorList;
+}
+
+?>
